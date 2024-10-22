@@ -1,11 +1,100 @@
+# -*- mode: python -*-
+"""pdb-attach is a python debugger that can attach to running processes."""
+
+import argparse
+import io
+import os
+import pdb
+import signal
+import socket
 import sys
 
+__all__ = ["listen", "unlisten"]
 
-class _PdbStr(str):
+
+def listen(port):
+    old_handler = signal.getsignal(signal.SIGUSR1)
+    debugger = PdbServer(old_handler, port)
+    signal.signal(signal.SIGUSR1, debugger)
+
+
+def unlisten():
+    cur_handler = signal.getsignal(signal.SIGUSR1)
+    if isinstance(cur_handler, PdbServer):
+        cur_handler.close()
+        signal.signal(signal.SIGUSR1, cur_handler._old_handler)
+
+
+class PdbServer(pdb.Pdb):
+    """PdbServer is a backend that uses signal handlers to start the server."""
+
+    # Set use_rawinput to False to defer io to file object arguments passed to
+    # stdin and stdout.
+    use_rawinput = False
+
+    def __init__(self, old_handler, port, *args, **kwargs):
+        self._old_handler = old_handler
+        self._sock = socket.socket()
+        self._sock.bind(("localhost", port))
+        self._sock.listen(0)
+
+        if "stdin" in kwargs:
+            del kwargs["stdin"]
+        if "stdout" in kwargs:
+            del kwargs["stdout"]
+
+        pdb.Pdb.__init__(self, *args, **kwargs)
+        self.prompt = PdbStr(self.prompt, prompt=True)
+
+    def __call__(self, signum, frame):
+        """Start tracing the program."""
+        self.set_trace(frame)
+
+    def set_trace(self, frame=None):
+        """Accept the connection to the client and start tracing the program."""
+        self.stdin = self.stdout = PdbIOWrapper(self._sock.accept()[0])
+        pdb.Pdb.set_trace(self, frame)
+
+    def do_detach(self, arg):
+        """Detach and disconnect socket."""
+        self.clear_all_breaks()
+        self.set_continue()
+        self.stdin._sock.close()
+        return True
+
+
+class PdbClient:
+    def __init__(self, pid, port):
+        self.server_pid = pid
+        self.port = port
+        self._client = None
+        self._client_io = None
+
+    def connect(self):
+        """Send a signal before connecting."""
+        os.kill(self.server_pid, signal.SIGUSR1)
+        self._client_io = PdbIOWrapper(
+            socket.create_connection(("localhost", self.port))
+        )
+
+    def raise_eoferror(self):
+        if not self._client_io.raise_eoferror():
+            return "", True
+        return self._client_io.read_prompt()
+
+    def send_and_recv(self, cmd):
+        if not cmd.endswith(os.linesep):
+            cmd += os.linesep
+        self._client_io.write(cmd)
+        return self._client_io.read_prompt()
+
+
+class PdbStr(str):
     def __new__(cls, value, prompt=False):
         self = str.__new__(cls, value)
         self.is_prompt = prompt
         return self
+
 
 class PdbIOWrapper(io.TextIOBase):
     """Wrapper for socket IO.
@@ -43,13 +132,13 @@ class PdbIOWrapper(io.TextIOBase):
 
         Returns
         -------
-        (_PdbStr, code)
+        (PdbStr, code)
         """
         msg_data = ""
         while msg_data.count("|") < 2:
             c = self._sock.recv(1)
             if len(c) == 0:
-                return _PdbStr(""), self._CLOSED
+                return PdbStr(""), self._CLOSED
 
             msg_data += c.decode(self.encoding, self.errors)
 
@@ -61,7 +150,7 @@ class PdbIOWrapper(io.TextIOBase):
 
         msg = self._sock.recv(msg_size).decode(self.encoding, self.errors)
         return_code = code if len(msg) == msg_size else self._CLOSED
-        return (_PdbStr(msg, prompt=(code == self._PROMPT)), return_code)
+        return (PdbStr(msg, prompt=(code == self._PROMPT)), return_code)
 
     def _read_eof(self):
         while True:
@@ -173,8 +262,8 @@ class PdbIOWrapper(io.TextIOBase):
         -------
         int : The number of bytes written to the socket.
         """
-        if not isinstance(msg, _PdbStr):
-            msg = _PdbStr(msg)
+        if not isinstance(msg, PdbStr):
+            msg = PdbStr(msg)
         code = self._PROMPT if msg.is_prompt else self._TEXT
         data = self._format_msg(msg, code=code)
         try:
@@ -185,3 +274,32 @@ class PdbIOWrapper(io.TextIOBase):
         # Offset num bytes written by the additional characters in the formatted
         # message.
         return len(msg)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "pid", type=int, metavar="PID", help="The pid of the process to debug."
+    )
+    parser.add_argument(
+        "port",
+        type=int,
+        metavar="PORT",
+        help="The port to connect to the running process.",
+    )
+    args = parser.parse_args()
+
+    client = PdbClient(args.pid, args.port)
+    client.connect()
+    lines, closed = client._client_io.read_prompt()
+    while closed is False:
+        try:
+            lines, closed = client.send_and_recv(input(lines))
+        except EOFError:
+            lines, closed = client.raise_eoferror()
+    if len(lines) > 0:
+        print(lines)
+
+
+if "__main__" == __name__:
+    main()
