@@ -2,7 +2,7 @@
 """Pdb-attach client that can be run as a module."""
 import argparse
 
-from pdb_attach.pdb_signal import PdbSignaler
+from . import PdbClient
 
 if "__main__" == __name__:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -17,20 +17,13 @@ if "__main__" == __name__:
     )
     args = parser.parse_args()
 
-    client = PdbSignaler(args.pid, args.port)
+    client = PdbClient(args.pid, args.port)
     client.connect()
-    lines, closed = client.recv()
+    lines, closed = client._client_io.read_prompt()
     while closed is False:
         try:
-            try:
-                to_server = raw_input(lines)  # type: ignore
-            except NameError:
-                # Ignore flake8 warning about input in Python 2.7 since we are checking for raw_input first.
-                to_server = input(lines)  # noqa:S322
-
-            lines, closed = client.send_and_recv(to_server)
+            lines, closed = client.send_and_recv(input(lines))
         except EOFError:
             lines, closed = client.raise_eoferror()
-
     if len(lines) > 0:
         print(lines)
